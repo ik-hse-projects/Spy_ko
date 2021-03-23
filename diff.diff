@@ -11,6 +11,75 @@ index 6fba7daba..eeff3dc1a 100644
  obj-$(CONFIG_GENERIC_PHY)	+= phy/
  
  # GPIO must come after pinctrl as gpios may need to mux pins etc
+diff --git a/drivers/ps2_counter.rs b/drivers/ps2_counter.rs
+new file mode 100644
+index 000000000..ff8a83617
+--- /dev/null
++++ b/drivers/ps2_counter.rs
+@@ -0,0 +1,63 @@
++#![no_std]
++#![feature(allocator_api, global_asm)]
++#![feature(test)]
++
++use kernel::prelude::*;
++use kernel::cstr;
++use kernel::c_types::c_void;
++use kernel::bindings::{
++    request_threaded_irq, free_irq,
++    irqreturn_t,
++    irqreturn_IRQ_HANDLED as IRQ_HANDLED,
++    IRQF_SHARED
++};
++use core::sync::atomic::AtomicUsize;
++
++module! {
++    type: Ps2Counter,
++    name: b"ps2_counter",
++    author: b"Ilya Konnov",
++    description: b"Simple module that counts number of PS/2 keypresses",
++    license: b"GPL v2",
++    params: {},
++}
++
++struct Ps2Counter {
++    counter: AtomicUsize
++}
++
++impl Ps2Counter {
++    unsafe extern "C" fn handler(irq: i32, this: *mut c_void) -> irqreturn_t {
++        let this = &mut *(this as *mut Self);
++        println!("Hello!");
++        IRQ_HANDLED
++    }
++}
++
++impl KernelModule for Ps2Counter {
++    fn init() -> KernelResult<Self> {
++        unsafe {
++            let res = request_threaded_irq(
++                /* line */1,
++                /* handler */ Some(Self::handler),
++                /* thread_fn */ None,
++                /* irqflags */ IRQF_SHARED as _,
++                /* name */ (&cstr!("ps2counter")) as *const _ as *const _,
++                /* cookie */ Self::handler as *mut _
++            );
++            println!("ReqIrq: {}", res);
++            assert_eq!(res, 0);
++        }
++        Ok(Ps2Counter {
++            counter: AtomicUsize::new(0),
++        })
++    }
++}
++
++impl Drop for Ps2Counter {
++    fn drop(&mut self) {
++        unsafe {
++            free_irq(1, core::ptr::null_mut());
++        }
++    }
++}
 diff --git a/rust/Makefile b/rust/Makefile
 index eb8f12ce1..fa38bb076 100644
 --- a/rust/Makefile
