@@ -1,0 +1,26 @@
+diff --git a/rust/kernel/bindings.rs b/rust/kernel/bindings.rs
+index 1944ce0d9..ee6453a2d 100644
+--- a/rust/kernel/bindings.rs
++++ b/rust/kernel/bindings.rs
+@@ -14,8 +14,21 @@
+ mod bindings_raw {
+     use crate::c_types;
+     include!(env!("RUST_BINDINGS_FILE"));
++
++    // This function is marked inline, so rewrite it in rust
++    #[inline(always)]
++    pub unsafe fn request_irq(
++        irq: c_types::c_uint,
++        handler: irq_handler_t,
++        flags: c_types::c_ulong,
++        name: *const c_types::c_char,
++        dev: *mut c_types::c_void,
++    ) -> c_types::c_int {
++        request_threaded_irq(irq, handler, None, flags, name, dev)
++    }
+ }
+ pub use bindings_raw::*;
+ 
+ pub const GFP_KERNEL: gfp_t = BINDINGS_GFP_KERNEL;
+ pub const __GFP_ZERO: gfp_t = BINDINGS___GFP_ZERO;
++

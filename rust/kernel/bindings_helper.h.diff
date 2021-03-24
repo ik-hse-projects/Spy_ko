@@ -1,0 +1,12 @@
+diff --git a/rust/kernel/bindings_helper.h b/rust/kernel/bindings_helper.h
+index 39b0cea37..3e0a1d1f4 100644
+--- a/rust/kernel/bindings_helper.h
++++ b/rust/kernel/bindings_helper.h
+@@ -10,6 +10,7 @@
+ #include <linux/version.h>
+ #include <linux/miscdevice.h>
+ #include <linux/poll.h>
++#include <linux/interrupt.h>
+ 
+ // `bindgen` gets confused at certain things
+ const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;

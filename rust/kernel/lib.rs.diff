@@ -1,0 +1,14 @@
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 504bb0a21..9129350f4 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -33,7 +33,8 @@ use core::panic::PanicInfo;
+ 
+ mod allocator;
+ 
+-#[doc(hidden)]
++//#[doc(hidden)]
++#[allow(warnings, unused, missing_docs)]
+ pub mod bindings;
+ 
+ pub mod buffer;
