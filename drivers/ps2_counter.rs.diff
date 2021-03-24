@@ -1,11 +1,11 @@
 diff --git a/drivers/ps2_counter.rs b/drivers/ps2_counter.rs
 new file mode 100644
-index 000000000..ff8a83617
+index 000000000..9552edd3e
 --- /dev/null
 +++ b/drivers/ps2_counter.rs
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,129 @@
 +#![no_std]
-+#![feature(allocator_api, global_asm)]
++#![feature(allocator_api, global_asm, asm)]
 +#![feature(test)]
 +
 +use kernel::prelude::*;
@@ -15,9 +15,41 @@ index 000000000..ff8a83617
 +    request_threaded_irq, free_irq,
 +    irqreturn_t,
 +    irqreturn_IRQ_HANDLED as IRQ_HANDLED,
++    irqreturn_IRQ_NONE as IRQ_NONE,
 +    IRQF_SHARED
 +};
-+use core::sync::atomic::AtomicUsize;
++use alloc::boxed::Box;
++use core::sync::atomic::{
++    AtomicUsize,
++    Ordering
++};
++
++// I'm not sure is reading directly from bindings::jiffies_64 will be really volatile.
++fn jiffies() -> u64 {
++    unsafe {
++        core::ptr::read_volatile(&kernel::bindings::jiffies_64 as *const u64)
++    }
++}
++
++// https://elixir.bootlin.com/linux/v5.11.9/source/arch/x86/boot/boot.h#L43
++// https://c9x.me/x86/html/file_module_x86_id_139.html
++fn inb(port: u16) -> u8 {
++    unsafe {
++        let v: u8;
++        asm!("in {}, dx", out(reg_byte) v, in("dx") port);
++        v
++    }
++}
++
++// https://elixir.bootlin.com/linux/v5.11.9/source/arch/x86/boot/boot.h#L39
++// https://c9x.me/x86/html/file_module_x86_id_222.html
++fn outb(v: u8, port: u16) -> u8 {
++    unsafe {
++        asm!("out dx, {}", in(reg_byte) v, in("dx") port);
++        v
++    }
++}
++
 +
 +module! {
 +    type: Ps2Counter,
@@ -28,34 +60,62 @@ index 000000000..ff8a83617
 +    params: {},
 +}
 +
-+struct Ps2Counter {
-+    counter: AtomicUsize
++struct CounterData {
++    count: AtomicUsize,
 +}
 +
-+impl Ps2Counter {
-+    unsafe extern "C" fn handler(irq: i32, this: *mut c_void) -> irqreturn_t {
-+        let this = &mut *(this as *mut Self);
-+        println!("Hello!");
++impl CounterData {
++    fn new() -> Self {
++        CounterData {
++            count: AtomicUsize::new(0)
++        }
++    }
++
++    fn handle_key(&mut self, irq: i32) -> irqreturn_t {
++        // Reading scancodes is fun, but that makes keylogger very obvious,
++        // since keypresses are not processed by "real" driver.
++        /*let scancode = inb(0x60);
++        println!("[{:x}]", scancode);*/
++
++
 +        IRQ_HANDLED
++    }
++
++    unsafe extern "C" fn trampoline(irq: i32, this: *mut c_void) -> irqreturn_t {
++        let this = &mut *(this as *mut Self);
++        this.handle_key(irq)
 +    }
 +}
 +
++
++struct Ps2Counter {
++    // Pointer to the boxed CounterData.
++    data: *mut CounterData
++}
++
++// Ps2Counter does about nothing, so we can share this pointer.
++unsafe impl Sync for Ps2Counter {}
++
 +impl KernelModule for Ps2Counter {
 +    fn init() -> KernelResult<Self> {
++        // Allocate in heap, since using statics in Rust is not so easy as in C.
++        let data = Box::new(CounterData::new());
++        let data = Box::into_raw(data);
 +        unsafe {
 +            let res = request_threaded_irq(
-+                /* line */1,
-+                /* handler */ Some(Self::handler),
++                /* line */ 1,
++                /* handler */ Some(CounterData::trampoline),
 +                /* thread_fn */ None,
 +                /* irqflags */ IRQF_SHARED as _,
 +                /* name */ (&cstr!("ps2counter")) as *const _ as *const _,
-+                /* cookie */ Self::handler as *mut _
++                /* cookie */ data as *mut _
 +            );
-+            println!("ReqIrq: {}", res);
-+            assert_eq!(res, 0);
++            if res < 0 {
++                return Err(kernel::Error::from_kernel_errno(res))
++            }
 +        }
 +        Ok(Ps2Counter {
-+            counter: AtomicUsize::new(0),
++            data
 +        })
 +    }
 +}
@@ -63,7 +123,13 @@ index 000000000..ff8a83617
 +impl Drop for Ps2Counter {
 +    fn drop(&mut self) {
 +        unsafe {
-+            free_irq(1, core::ptr::null_mut());
++            free_irq(1, &self.data as *const _ as *mut _);
++
++            // Now we should free up memory, used by CounterData.
++            let ptr = core::mem::replace(&mut self.data, core::ptr::null_mut());
++            if !ptr.is_null() {
++                let _ = Box::from_raw(ptr);
++            }
 +        }
 +    }
 +}
