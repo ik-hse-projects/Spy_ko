@@ -1,9 +1,9 @@
 diff --git a/drivers/ps2_counter.rs b/drivers/ps2_counter.rs
 new file mode 100644
-index 000000000..9552edd3e
+index 000000000..ca399e990
 --- /dev/null
 +++ b/drivers/ps2_counter.rs
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,189 @@
 +#![no_std]
 +#![feature(allocator_api, global_asm, asm)]
 +#![feature(test)]
@@ -12,19 +12,37 @@ index 000000000..9552edd3e
 +use kernel::cstr;
 +use kernel::c_types::c_void;
 +use kernel::bindings::{
++    timer_list,
++    del_timer,
++    mod_timer
++};
++use kernel::bindings::{
 +    request_threaded_irq, free_irq,
 +    irqreturn_t,
 +    irqreturn_IRQ_HANDLED as IRQ_HANDLED,
 +    irqreturn_IRQ_NONE as IRQ_NONE,
-+    IRQF_SHARED
++    IRQF_SHARED,
++    HZ
 +};
 +use alloc::boxed::Box;
 +use core::sync::atomic::{
 +    AtomicUsize,
 +    Ordering
 +};
++use core::mem::MaybeUninit;
++
++module! {
++    type: Ps2Counter,
++    name: b"ps2_counter",
++    author: b"Ilya Konnov",
++    description: b"Simple module that counts number of PS/2 keypresses",
++    license: b"GPL v2",
++    params: {},
++}
 +
 +// I'm not sure is reading directly from bindings::jiffies_64 will be really volatile.
++// Also we can't use get_jiffies_u64, since it is inlined.
++// So let's hope, that our machine can read u64 atomically.
 +fn jiffies() -> u64 {
 +    unsafe {
 +        core::ptr::read_volatile(&kernel::bindings::jiffies_64 as *const u64)
@@ -50,47 +68,60 @@ index 000000000..9552edd3e
 +    }
 +}
 +
-+
-+module! {
-+    type: Ps2Counter,
-+    name: b"ps2_counter",
-+    author: b"Ilya Konnov",
-+    description: b"Simple module that counts number of PS/2 keypresses",
-+    license: b"GPL v2",
-+    params: {},
-+}
-+
 +struct CounterData {
-+    count: AtomicUsize,
++    counter: AtomicUsize,
 +}
++
++static CounterInstance: CounterData = CounterData::new();
 +
 +impl CounterData {
-+    fn new() -> Self {
++    const fn new() -> Self {
 +        CounterData {
-+            count: AtomicUsize::new(0)
++            counter: AtomicUsize::new(0),
 +        }
 +    }
 +
-+    fn handle_key(&mut self, irq: i32) -> irqreturn_t {
++    fn handle_key(&self) -> irqreturn_t {
 +        // Reading scancodes is fun, but that makes keylogger very obvious,
 +        // since keypresses are not processed by "real" driver.
 +        /*let scancode = inb(0x60);
 +        println!("[{:x}]", scancode);*/
 +
++        // Relaxed will work fine: https://doc.rust-lang.org/nomicon/atomics.html#relaxed
++        CounterInstance.counter.fetch_add(1, Ordering::Relaxed);
 +
 +        IRQ_HANDLED
 +    }
 +
-+    unsafe extern "C" fn trampoline(irq: i32, this: *mut c_void) -> irqreturn_t {
-+        let this = &mut *(this as *mut Self);
-+        this.handle_key(irq)
++    unsafe extern "C" fn timer_callback(timer: *mut timer_list) {
++        let now = jiffies();
++        println!("Hello from timer (now is {}jf)", now);
++        // Setup timer again
++        unsafe {
++            let _res = mod_timer(timer, now + delay);
++        }
++    }
++
++    fn get_ptr(&self) -> *const Self {
++        self as *const Self
++    }
++
++    unsafe extern "C" fn trampoline(irq: i32, cookie: *mut c_void) -> irqreturn_t {
++        // It's important to not trust signature, that cookie is mut.
++        // We can't crate mutable reference to it, since there is immutable one exist.
++        if !core::ptr::eq(CounterInstance.get_ptr(), cookie as *const _) || irq != 1 {
++            println!("Something went wrong. Ignoring.");
++            IRQ_NONE
++        } else {
++            CounterInstance.handle_key()
++        }
 +    }
 +}
 +
++const delay: u64 = 4 * (HZ as u64);
 +
 +struct Ps2Counter {
-+    // Pointer to the boxed CounterData.
-+    data: *mut CounterData
++    timer: *mut kernel::bindings::timer_list,
 +}
 +
 +// Ps2Counter does about nothing, so we can share this pointer.
@@ -98,24 +129,57 @@ index 000000000..9552edd3e
 +
 +impl KernelModule for Ps2Counter {
 +    fn init() -> KernelResult<Self> {
-+        // Allocate in heap, since using statics in Rust is not so easy as in C.
-+        let data = Box::new(CounterData::new());
-+        let data = Box::into_raw(data);
++        // Firstly, setup an interrupt handler.
++        println!("Setting handler");
 +        unsafe {
 +            let res = request_threaded_irq(
 +                /* line */ 1,
 +                /* handler */ Some(CounterData::trampoline),
 +                /* thread_fn */ None,
 +                /* irqflags */ IRQF_SHARED as _,
-+                /* name */ (&cstr!("ps2counter")) as *const _ as *const _,
-+                /* cookie */ data as *mut _
++                /* name */ (b"ps2counter\0") as *const _ as *const _,
++                /* cookie */ CounterInstance.get_ptr() as *mut _
 +            );
-+            if res < 0 {
-+                return Err(kernel::Error::from_kernel_errno(res))
-+            }
++            if res < 0 { return Err(kernel::Error::from_kernel_errno(res)) }
 +        }
++
++        // Then initialize timer.
++        println!("Setting timer");
++        let timer = unsafe {
++            // `timer_setup` is a macro, that calls `__init_timer`
++            //     (https://elixir.bootlin.com/linux/v5.11.10/source/include/linux/timer.h#L141)
++            // `__init_timer` is a macro too, that calls `init_timer_key`
++            //     (https://elixir.bootlin.com/linux/v5.11.10/source/include/linux/timer.h#L125)
++            // Finally, `init_timer_key` is a function that we can use.
++            use kernel::bindings::{
++                init_timer_key,
++                lock_class_key,
++            };
++            static mut key: MaybeUninit<lock_class_key> = MaybeUninit::uninit();
++            static mut timer: MaybeUninit<timer_list> = MaybeUninit::uninit();
++            let res = init_timer_key(
++                /* timer */ timer.as_mut_ptr(),
++                /* func */ Some(CounterData::timer_callback),
++                /* flags */ 0,
++                /* name */ b"ps2counter_timer\0" as *const _ as *const _,
++                /* key */ key.as_mut_ptr()
++            );
++
++            // Return initialized timer from this block:
++            timer.as_mut_ptr()
++        };
++
++        // Finally we want to set timer
++        println!("mod_timer for {} jiffies", delay);
++        unsafe {
++            // We can't use msecs_to_jiffies directly, since this function is always inlined.
++            // So we will just use HZ directly.
++            let res = mod_timer(timer, jiffies() + delay);
++            if res < 0 { return Err(kernel::Error::from_kernel_errno(res)) }
++        }
++
 +        Ok(Ps2Counter {
-+            data
++            timer
 +        })
 +    }
 +}
@@ -123,13 +187,9 @@ index 000000000..9552edd3e
 +impl Drop for Ps2Counter {
 +    fn drop(&mut self) {
 +        unsafe {
-+            free_irq(1, &self.data as *const _ as *mut _);
-+
-+            // Now we should free up memory, used by CounterData.
-+            let ptr = core::mem::replace(&mut self.data, core::ptr::null_mut());
-+            if !ptr.is_null() {
-+                let _ = Box::from_raw(ptr);
-+            }
++            free_irq(1, CounterInstance.get_ptr() as *mut _);
++            del_timer(self.timer);
++            self.timer = core::ptr::null_mut();
 +        }
 +    }
 +}
