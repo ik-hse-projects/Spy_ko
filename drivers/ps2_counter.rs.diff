@@ -1,9 +1,9 @@
 diff --git a/drivers/ps2_counter.rs b/drivers/ps2_counter.rs
 new file mode 100644
-index 000000000..ca399e990
+index 000000000..149ed9ae1
 --- /dev/null
 +++ b/drivers/ps2_counter.rs
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,211 @@
 +#![no_std]
 +#![feature(allocator_api, global_asm, asm)]
 +#![feature(test)]
@@ -27,6 +27,7 @@ index 000000000..ca399e990
 +use alloc::boxed::Box;
 +use core::sync::atomic::{
 +    AtomicUsize,
++    AtomicU64,
 +    Ordering
 +};
 +use core::mem::MaybeUninit;
@@ -70,6 +71,7 @@ index 000000000..ca399e990
 +
 +struct CounterData {
 +    counter: AtomicUsize,
++    last_printed: AtomicU64
 +}
 +
 +static CounterInstance: CounterData = CounterData::new();
@@ -78,6 +80,8 @@ index 000000000..ca399e990
 +    const fn new() -> Self {
 +        CounterData {
 +            counter: AtomicUsize::new(0),
++            // FIXME: It should be initial jiffies value
++            last_printed: AtomicU64::new(0),
 +        }
 +    }
 +
@@ -94,11 +98,29 @@ index 000000000..ca399e990
 +    }
 +
 +    unsafe extern "C" fn timer_callback(timer: *mut timer_list) {
-+        let now = jiffies();
-+        println!("Hello from timer (now is {}jf)", now);
-+        // Setup timer again
++        let now: u64 = jiffies();
++        let last = CounterInstance.last_printed.load(Ordering::Relaxed);
++        let (mut diff, overflowed) = now.overflowing_sub(last);
++        if overflowed {
++            diff += u64::MAX;
++        }
++        if diff < delay {
++            let (until, _) = now.overflowing_add(diff);
++            unsafe {
++                let _res = mod_timer(timer, until);
++            }
++            return;
++        }
++
++        let counter = CounterInstance.counter.swap(0, Ordering::SeqCst);
++        // Account that PS/2 sends events for keydown and for keyup.
++        let counter = counter / 2;
++        println!("{} keys pressed", counter);
++        CounterInstance.last_printed.store(now, Ordering::Relaxed);
++
++        let (until, _) = now.overflowing_add(delay);
 +        unsafe {
-+            let _res = mod_timer(timer, now + delay);
++            let _res = mod_timer(timer, until);
 +        }
 +    }
 +
@@ -118,7 +140,7 @@ index 000000000..ca399e990
 +    }
 +}
 +
-+const delay: u64 = 4 * (HZ as u64);
++const delay: u64 = 10 * (HZ as u64);
 +
 +struct Ps2Counter {
 +    timer: *mut kernel::bindings::timer_list,
