@@ -1,9 +1,9 @@
 diff --git a/rust/kernel/timer.rs b/rust/kernel/timer.rs
 new file mode 100644
-index 000000000..0858d5c92
+index 000000000..187ab4ff6
 --- /dev/null
 +++ b/rust/kernel/timer.rs
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,168 @@
 +use crate::bindings::{
 +    timer_list, lock_class_key,
 +    del_timer, mod_timer,
@@ -16,10 +16,6 @@ index 000000000..0858d5c92
 +use core::pin::Pin;
 +use core::mem::MaybeUninit;
 +use core::marker::PhantomPinned;
-+
-+// FIXME: Add support for CONFIG_LOCKDEP
-+// When this option is disabled, we should not pass name and key.
-+crate::static_assert!(cfg!(CONFIG_LOCKDEP));
 +
 +/// # Safety
 +/// It is highly recommeneded to use this only in const context
@@ -61,7 +57,6 @@ index 000000000..0858d5c92
 +        }
 +    }
 +}
-+
 +
 +pub use crate::bindings::{
 +    TIMER_DEFERRABLE as DEFERRABLE,
@@ -111,10 +106,6 @@ index 000000000..0858d5c92
 +unsafe impl<'a, F> Send for Timer<'a, F> {}
 +unsafe impl<'a, F> Sync for Timer<'a, F> {}
 +
-+unsafe extern "C" fn dummy(list: *mut timer_list) {
-+    crate::println!("\n\nDummy\n\n");
-+}
-+
 +impl<'a, F> Timer<'a, F> where
 +    F: Fn(&TimerList),
 +{
@@ -135,7 +126,7 @@ index 000000000..0858d5c92
 +    pub fn new_with_flags(name: CStr<'a>, callback: F, flags: u32) -> Pin<Box<Self>> {
 +        // Create self on stack. In future it will be better to use box_syntax, but it is unstable:
 +        // [Tracking issue for box_syntax]: https://github.com/rust-lang/rust/issues/49733
-+        let mut result = Self {
++        let result = Self {
 +            _pinned: PhantomPinned::default(),
 +            list: TimerList {
 +                list: MaybeUninit::uninit(),
@@ -150,13 +141,17 @@ index 000000000..0858d5c92
 +            // FIXME: There should be some way to use as_mut_ptr instead of casting.
 +            let list_ptr = result.list.list.as_ptr() as *mut _;
 +            let key_ptr = result.key.as_ptr() as *mut _;
++            // FIXME: Add support for CONFIG_LOCKDEP
++            // When this option is disabled, we should not pass name and key.
 +            init_timer_key(
 +                /* timer */ list_ptr,
-+                /* func  */ Some(dummy),
++                /* func  */ Some(Self::wrapper),
 +                /* flags */ flags,
-+                /* name  */ b"asdfasdfasdf\0" as *const _ as *const _,
++                /* name  */ result.name.as_ptr() as *const i8,
 +                /* key   */ key_ptr,
 +            );
++            // At this point it's safe to assume that result.list.list and result.key
++            // are completely initialized.
 +        }
 +        result
 +    }
