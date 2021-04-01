@@ -1,9 +1,9 @@
 diff --git a/drivers/ps2_counter.rs b/drivers/ps2_counter.rs
 new file mode 100644
-index 000000000..149ed9ae1
+index 000000000..c487e55c2
 --- /dev/null
 +++ b/drivers/ps2_counter.rs
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,221 @@
 +#![no_std]
 +#![feature(allocator_api, global_asm, asm)]
 +#![feature(test)]
@@ -11,6 +11,7 @@ index 000000000..149ed9ae1
 +use kernel::prelude::*;
 +use kernel::cstr;
 +use kernel::c_types::c_void;
++use kernel::timer::{Timer, TimerList};
 +use kernel::bindings::{
 +    timer_list,
 +    del_timer,
@@ -71,7 +72,7 @@ index 000000000..149ed9ae1
 +
 +struct CounterData {
 +    counter: AtomicUsize,
-+    last_printed: AtomicU64
++    last_printed: AtomicU64,
 +}
 +
 +static CounterInstance: CounterData = CounterData::new();
@@ -142,8 +143,13 @@ index 000000000..149ed9ae1
 +
 +const delay: u64 = 10 * (HZ as u64);
 +
++fn bar(_: &TimerList) {
++    println!("ASHDGJKASGDH");
++}
++
 +struct Ps2Counter {
 +    timer: *mut kernel::bindings::timer_list,
++    foo: Timer<'static, fn(&TimerList)>
 +}
 +
 +// Ps2Counter does about nothing, so we can share this pointer.
@@ -169,7 +175,7 @@ index 000000000..149ed9ae1
 +        println!("Setting timer");
 +        let timer = unsafe {
 +            // `timer_setup` is a macro, that calls `__init_timer`
-+            //     (https://elixir.bootlin.com/linux/v5.11.10/source/include/linux/timer.h#L141)
++            //     https://elixir.bootlin.com/linux/v5.11.10/source/include/linux/timer.h#L141)
 +            // `__init_timer` is a macro too, that calls `init_timer_key`
 +            //     (https://elixir.bootlin.com/linux/v5.11.10/source/include/linux/timer.h#L125)
 +            // Finally, `init_timer_key` is a function that we can use.
@@ -200,8 +206,12 @@ index 000000000..149ed9ae1
 +            if res < 0 { return Err(kernel::Error::from_kernel_errno(res)) }
 +        }
 +
++        let mut foo = Timer::new(cstr!("ASdf"), bar as _);
++        foo.as_mut().modify(jiffies() + (2*HZ) as u64);
++
 +        Ok(Ps2Counter {
-+            timer
++            timer,
++            foo
 +        })
 +    }
 +}

@@ -1,0 +1,179 @@
+diff --git a/rust/kernel/timer.rs b/rust/kernel/timer.rs
+new file mode 100644
+index 000000000..0858d5c92
+--- /dev/null
++++ b/rust/kernel/timer.rs
+@@ -0,0 +1,173 @@
++use crate::bindings::{
++    timer_list, lock_class_key,
++    del_timer, mod_timer,
++    init_timer_key,
++};
++use crate::CStr;
++
++// FIXME: Add support for static timers without using Box.
++use alloc::boxed::Box;
++use core::pin::Pin;
++use core::mem::MaybeUninit;
++use core::marker::PhantomPinned;
++
++// FIXME: Add support for CONFIG_LOCKDEP
++// When this option is disabled, we should not pass name and key.
++crate::static_assert!(cfg!(CONFIG_LOCKDEP));
++
++/// # Safety
++/// It is highly recommeneded to use this only in const context
++macro_rules! memoffset {
++    ($base:ty => $($field:ident).+) => {
++        unsafe {
++            // Mostly inspired by https://github.com/Gilnaa/memoffset
++
++            // SAFETY:
++            // 0. If are running in const context, any UB should become compilation error.
++            // 1. We are creating pointer to uninitialized memory and dereferencing it.
++            //    This is an UB, but we are not reading nor writing to such memory.
++            // 2. core::ptr::offset_from requires following:
++            //    - pointers must point to same allocated object.
++            //      It's true, since we are using single MaybeUninit::uninit()
++            //    - pointers must be derived from a pointer to the same object.
++            //      Same: both are derived from base pointer.
++            //    - distance between the pointers, in bytes, cannot overflow an isize
++            //      Let's hope that no one will create single struct lareger than isize::MAX.
++            //    - distance between the pointers, in bytes, must be an exact multiple of the size of T
++            //      We are casting them to *const u8, so it's true.
++            //    - The distance being in bounds cannot rely on "wrapping around" the address space.
++            //      We do not rely on that.
++
++            // Firstly, create uninitialized $base.
++            let base: MaybeUninit<$base> = MaybeUninit::uninit();
++            let base: *const $base = base.as_ptr();
++
++            // Then get pointers to a field.
++            // This is an UB, since we are creating reference to an uninitialized memory.
++            let field = core::ptr::addr_of!((&*base)$(.$field)*);
++
++            // Cast everything into u8 pointers, so all units are bytes.
++            let base = base as *const u8;
++            let field = field as *const u8;
++
++            // Finally, compute the offset
++            field.offset_from(base)
++        }
++    }
++}
++
++
++pub use crate::bindings::{
++    TIMER_DEFERRABLE as DEFERRABLE,
++    TIMER_IRQSAFE as IRQSAFE,
++    TIMER_PINNED as PINNED,
++};
++
++#[repr(transparent)]
++pub struct TimerList {
++    list: MaybeUninit<timer_list>,
++}
++
++impl TimerList {
++    /// Returns was the timer active.
++    /// ie. modifying inactive timer will return false.
++    pub fn modify(mut self: Pin<&mut Self>, expires: u64) -> bool {
++        let res = unsafe {
++            mod_timer(self.list.as_mut_ptr(), expires)
++        };
++        res != 0
++    }
++}
++
++impl Drop for TimerList {
++    fn drop(&mut self) {
++        unsafe {
++            let ptr = self.list.as_mut_ptr();
++            del_timer(ptr);
++            core::ptr::drop_in_place(ptr);
++        }
++    }
++}
++
++pub struct Timer<'a, F=fn(&TimerList)> {
++    // Timer is Unpin, since list have a pointer to callback function. which is stored in the same
++    // struct. Probably in future we can implement Unpin for Timer when F is zero-sized-type.
++    _pinned: PhantomPinned,
++    // FIXME: We should wrap list into Rc, since it can be used while callback is running
++    // In such scenario we will create and use two mutable references to same timer_list.
++    list: TimerList,
++    callback: F,
++    name: CStr<'a>,
++    key: MaybeUninit<lock_class_key>,
++}
++
++// FIXME: It is not safe.
++unsafe impl<'a, F> Send for Timer<'a, F> {}
++unsafe impl<'a, F> Sync for Timer<'a, F> {}
++
++unsafe extern "C" fn dummy(list: *mut timer_list) {
++    crate::println!("\n\nDummy\n\n");
++}
++
++impl<'a, F> Timer<'a, F> where
++    F: Fn(&TimerList),
++{
++    const LIST_OFFSET: isize = memoffset!(Self => list);
++    const NESTED_LIST_OFFSET: isize = memoffset!(Self => list.list);
++    const CALLBACK_OFFSET: isize = memoffset!(Self => callback);
++
++    unsafe extern "C" fn wrapper(list: *mut timer_list) {
++        let base = (list as *const u8).offset(-Self::NESTED_LIST_OFFSET);
++        let list: *const TimerList = base.offset(Self::LIST_OFFSET) as *const _;
++        let callback: *const F = base.offset(Self::CALLBACK_OFFSET) as *const _;
++
++        let callback = &*callback;
++        let list = &*list;
++        callback(list);
++    }
++
++    pub fn new_with_flags(name: CStr<'a>, callback: F, flags: u32) -> Pin<Box<Self>> {
++        // Create self on stack. In future it will be better to use box_syntax, but it is unstable:
++        // [Tracking issue for box_syntax]: https://github.com/rust-lang/rust/issues/49733
++        let mut result = Self {
++            _pinned: PhantomPinned::default(),
++            list: TimerList {
++                list: MaybeUninit::uninit(),
++            },
++            name,
++            key: MaybeUninit::uninit(),
++            callback
++        };
++        // It's very-very important to pin it.
++        let mut result = Box::pin(result);
++        unsafe {
++            // FIXME: There should be some way to use as_mut_ptr instead of casting.
++            let list_ptr = result.list.list.as_ptr() as *mut _;
++            let key_ptr = result.key.as_ptr() as *mut _;
++            init_timer_key(
++                /* timer */ list_ptr,
++                /* func  */ Some(dummy),
++                /* flags */ flags,
++                /* name  */ b"asdfasdfasdf\0" as *const _ as *const _,
++                /* key   */ key_ptr,
++            );
++        }
++        result
++    }
++
++    pub fn new(name: CStr<'a>, callback: F) -> Pin<Box<Self>> {
++        Self::new_with_flags(name, callback, 0)
++    }
++
++    pub fn handle(self: Pin<&mut Self>) -> Pin<&mut TimerList> {
++        unsafe { self.map_unchecked_mut(|s| &mut s.list) }
++    }
++}
++
++impl<F> Drop for Timer<'_, F> {
++    fn drop(&mut self) {
++        unsafe {
++            core::ptr::drop_in_place(self.key.as_mut_ptr());
++        }
++    }
++}
