@@ -1,9 +1,9 @@
 diff --git a/rust/kernel/timer.rs b/rust/kernel/timer.rs
 new file mode 100644
-index 000000000..187ab4ff6
+index 000000000..5c7902625
 --- /dev/null
 +++ b/rust/kernel/timer.rs
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,204 @@
 +use crate::bindings::{
 +    timer_list, lock_class_key,
 +    del_timer, mod_timer,
@@ -11,11 +11,11 @@ index 000000000..187ab4ff6
 +};
 +use crate::CStr;
 +
-+// FIXME: Add support for static timers without using Box.
 +use alloc::boxed::Box;
 +use core::pin::Pin;
 +use core::mem::MaybeUninit;
 +use core::marker::PhantomPinned;
++use core::ops::DerefMut;
 +
 +/// # Safety
 +/// It is highly recommeneded to use this only in const context
@@ -64,39 +64,13 @@ index 000000000..187ab4ff6
 +    TIMER_PINNED as PINNED,
 +};
 +
-+#[repr(transparent)]
-+pub struct TimerList {
-+    list: MaybeUninit<timer_list>,
-+}
-+
-+impl TimerList {
-+    /// Returns was the timer active.
-+    /// ie. modifying inactive timer will return false.
-+    pub fn modify(mut self: Pin<&mut Self>, expires: u64) -> bool {
-+        let res = unsafe {
-+            mod_timer(self.list.as_mut_ptr(), expires)
-+        };
-+        res != 0
-+    }
-+}
-+
-+impl Drop for TimerList {
-+    fn drop(&mut self) {
-+        unsafe {
-+            let ptr = self.list.as_mut_ptr();
-+            del_timer(ptr);
-+            core::ptr::drop_in_place(ptr);
-+        }
-+    }
-+}
-+
-+pub struct Timer<'a, F=fn(&TimerList)> {
++pub struct Timer<'a, F=fn()> {
 +    // Timer is Unpin, since list have a pointer to callback function. which is stored in the same
 +    // struct. Probably in future we can implement Unpin for Timer when F is zero-sized-type.
 +    _pinned: PhantomPinned,
 +    // FIXME: We should wrap list into Rc, since it can be used while callback is running
 +    // In such scenario we will create and use two mutable references to same timer_list.
-+    list: TimerList,
++    list: MaybeUninit<timer_list>,
 +    callback: F,
 +    name: CStr<'a>,
 +    key: MaybeUninit<lock_class_key>,
@@ -106,68 +80,130 @@ index 000000000..187ab4ff6
 +unsafe impl<'a, F> Send for Timer<'a, F> {}
 +unsafe impl<'a, F> Sync for Timer<'a, F> {}
 +
-+impl<'a, F> Timer<'a, F> where
-+    F: Fn(&TimerList),
-+{
++pub struct TimerArgs<'a, F> {
++    pub name: CStr<'a>,
++    pub callback: F,
++    pub flags: u32
++}
++
++// TODO: Builder pattern
++
++impl<'a, F> Timer<'a, F> where F: Fn() {
 +    const LIST_OFFSET: isize = memoffset!(Self => list);
-+    const NESTED_LIST_OFFSET: isize = memoffset!(Self => list.list);
-+    const CALLBACK_OFFSET: isize = memoffset!(Self => callback);
-+
 +    unsafe extern "C" fn wrapper(list: *mut timer_list) {
-+        let base = (list as *const u8).offset(-Self::NESTED_LIST_OFFSET);
-+        let list: *const TimerList = base.offset(Self::LIST_OFFSET) as *const _;
-+        let callback: *const F = base.offset(Self::CALLBACK_OFFSET) as *const _;
-+
-+        let callback = &*callback;
-+        let list = &*list;
-+        callback(list);
++        let base = (list as *const u8).offset(-Self::LIST_OFFSET);
++        // FIXME: Is it safe?
++        let this = &*(base as *const Self);
++        (this.callback)();
 +    }
 +
-+    pub fn new_with_flags(name: CStr<'a>, callback: F, flags: u32) -> Pin<Box<Self>> {
-+        // Create self on stack. In future it will be better to use box_syntax, but it is unstable:
-+        // [Tracking issue for box_syntax]: https://github.com/rust-lang/rust/issues/49733
-+        let result = Self {
++    /// # Safety
++    /// Caller must ensure that place contains correct struct, with timer and key uninitialized.
++    unsafe fn initialize(self: Pin<&mut Self>, flags: u32) -> Pin<&mut Self> {
++        // FIXME: It's better to avoid using as_ptr() and then casting to *mut T
++        //        But Pin protects us from accessing &mut Self directly.
++        init_timer_key(
++            /* timer */ self.list.as_ptr() as *mut _,
++            /* func  */ Some(Self::wrapper),
++            /* flags */ flags,
++            /* name  */ self.name.as_ptr() as *const i8,
++            /* key   */ self.key.as_ptr() as *mut _,
++        );
++        self
++    }
++
++    /// # Safety
++    /// This function returns Timer without initializing it's fields.
++    /// Caller MUST call .initialize() before using timer.
++    unsafe fn new_uninitialized(args: TimerArgs<'a, F>) -> (Self, u32) {
++        let res = Self {
 +            _pinned: PhantomPinned::default(),
-+            list: TimerList {
-+                list: MaybeUninit::uninit(),
-+            },
-+            name,
++            list: MaybeUninit::uninit(),
++            name: args.name,
 +            key: MaybeUninit::uninit(),
-+            callback
++            callback: args.callback
 +        };
-+        // It's very-very important to pin it.
-+        let mut result = Box::pin(result);
++        (res, args.flags)
++    }
++
++    /// Creates timer inside of pinned MaybeUninit.
++    ///
++    /// # Safety
++    /// Caller must drop previous timer if there is any.
++    pub unsafe fn initialize_in<P>(mut place: Pin<P>, args: TimerArgs<'a, F>)
++        where P: DerefMut<Target = MaybeUninit<Self>>
++    {
++        // SAFETY: We MUST call .initialize() after pinning:
++        let (uninit, flags) = Self::new_uninitialized(args);
++
++        place.set(MaybeUninit::new(uninit));
++        let result: Pin<&mut MaybeUninit<Self>> = place.as_mut();
++
++        // SAFETY:
++        // 1. We just initialized MaybeUninit, so we can dereference pointer.
++        // 2. Map function is good in terms of "map_unchecked_mut".
++        let result: Pin<&mut Self> = result.map_unchecked_mut(|x| &mut *x.as_mut_ptr());
++
++        result.initialize(flags);
++    }
++
++    /// Creates timer inside of pinned option, dropping and overwriting previous timer if any.
++    pub fn in_option<'b, P>(place: &'b mut Pin<P>, args: TimerArgs<'a, F>) -> Pin<&'b mut Self>
++        where P: DerefMut<Target = Option<Self>>
++    {
 +        unsafe {
-+            // FIXME: There should be some way to use as_mut_ptr instead of casting.
-+            let list_ptr = result.list.list.as_ptr() as *mut _;
-+            let key_ptr = result.key.as_ptr() as *mut _;
-+            // FIXME: Add support for CONFIG_LOCKDEP
-+            // When this option is disabled, we should not pass name and key.
-+            init_timer_key(
-+                /* timer */ list_ptr,
-+                /* func  */ Some(Self::wrapper),
-+                /* flags */ flags,
-+                /* name  */ result.name.as_ptr() as *const i8,
-+                /* key   */ key_ptr,
-+            );
-+            // At this point it's safe to assume that result.list.list and result.key
-+            // are completely initialized.
++            // SAFETY: We MUST call .initialize() after pinning:
++            let (uninit, flags) = Self::new_uninitialized(args);
++
++            place.set(Some(uninit));
++            let result: Pin<&mut Option<Self>> = place.as_mut();
++
++            // SAFETY:
++            // 1. We just initialized Option, so we can unsafely unwrap it.
++            //    FIXME: Waiting fot [option_result_unwrap_unchecked] stabilized
++            //    [option_result_unwrap_unchecked]: https://github.com/rust-lang/rust/issues/63291
++            // 2. Map function is good in terms of "map_unchecked_mut".
++            let result: Pin<&mut Self> = result
++                .map_unchecked_mut(|x| x.as_mut().unwrap());
++
++            result.initialize(flags)
 +        }
-+        result
 +    }
 +
-+    pub fn new(name: CStr<'a>, callback: F) -> Pin<Box<Self>> {
-+        Self::new_with_flags(name, callback, 0)
++    /// Creates timer on heap and returns it.
++    ///
++    /// Eaisest and safest way to create a timer.
++    pub fn boxed(args: TimerArgs<'a, F>) -> Pin<Box<Self>> {
++        unsafe {
++            let (uninit, flags) = Self::new_uninitialized(args);
++
++            let mut result: Pin<Box<Self>> = Box::pin(uninit);
++            result.as_mut().initialize(flags);
++
++            result
++        }
 +    }
 +
-+    pub fn handle(self: Pin<&mut Self>) -> Pin<&mut TimerList> {
-+        unsafe { self.map_unchecked_mut(|s| &mut s.list) }
++    /// Returns was the timer active.
++    /// ie. modifying inactive timer will return false.
++    pub fn modify(self: Pin<&mut Self>, expires: u64) -> bool {
++        let res = unsafe {
++            // SAFETY: We won't move any data
++            let this = self.get_unchecked_mut();
++            // SAFETY: self.list is initialized
++            mod_timer(this.list.as_mut_ptr(), expires)
++        };
++        res != 0
 +    }
 +}
 +
 +impl<F> Drop for Timer<'_, F> {
 +    fn drop(&mut self) {
 +        unsafe {
++            let timer_list = self.list.as_mut_ptr();
++            del_timer(timer_list);
++            core::ptr::drop_in_place(timer_list);
++
 +            core::ptr::drop_in_place(self.key.as_mut_ptr());
 +        }
 +    }
