@@ -1,0 +1,10 @@
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index d8f5310e22ba..3b686b374bed 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -28,3 +28,5 @@ obj-$(CONFIG_INPUT_MISC)	+= misc/
+ obj-$(CONFIG_INPUT_APMPOWER)	+= apm-power.o
+ 
+ obj-$(CONFIG_RMI4_CORE)		+= rmi4/
++
++obj-$(CONFIG_INPUT_PS2COUNTER)	+= ps2_counter.o

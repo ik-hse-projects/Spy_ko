@@ -1,210 +1,223 @@
 diff --git a/rust/kernel/timer.rs b/rust/kernel/timer.rs
-new file mode 100644
-index 000000000..5c7902625
---- /dev/null
+index 92ab8ee79b5a..eded0ca5f2a9 100644
+--- a/rust/kernel/timer.rs
 +++ b/rust/kernel/timer.rs
-@@ -0,0 +1,204 @@
-+use crate::bindings::{
-+    timer_list, lock_class_key,
-+    del_timer, mod_timer,
-+    init_timer_key,
-+};
-+use crate::CStr;
-+
-+use alloc::boxed::Box;
-+use core::pin::Pin;
+@@ -1,20 +1,17 @@
+-use crate::bindings::{
+-    timer_list, lock_class_key,
+-    del_timer_sync, mod_timer,
+-    init_timer_key,
+-};
++use crate::bindings::{del_timer_sync, init_timer_key, lock_class_key, mod_timer, timer_list};
+ use crate::CStr;
+ 
+ use alloc::boxed::Box;
+-use core::pin::Pin;
+-use core::mem::MaybeUninit;
++use core::cell::UnsafeCell;
+ use core::marker::PhantomPinned;
 +use core::mem::MaybeUninit;
-+use core::marker::PhantomPinned;
-+use core::ops::DerefMut;
-+
-+/// # Safety
-+/// It is highly recommeneded to use this only in const context
-+macro_rules! memoffset {
-+    ($base:ty => $($field:ident).+) => {
-+        unsafe {
-+            // Mostly inspired by https://github.com/Gilnaa/memoffset
-+
-+            // SAFETY:
-+            // 0. If are running in const context, any UB should become compilation error.
-+            // 1. We are creating pointer to uninitialized memory and dereferencing it.
-+            //    This is an UB, but we are not reading nor writing to such memory.
-+            // 2. core::ptr::offset_from requires following:
-+            //    - pointers must point to same allocated object.
-+            //      It's true, since we are using single MaybeUninit::uninit()
-+            //    - pointers must be derived from a pointer to the same object.
-+            //      Same: both are derived from base pointer.
-+            //    - distance between the pointers, in bytes, cannot overflow an isize
-+            //      Let's hope that no one will create single struct lareger than isize::MAX.
-+            //    - distance between the pointers, in bytes, must be an exact multiple of the size of T
-+            //      We are casting them to *const u8, so it's true.
-+            //    - The distance being in bounds cannot rely on "wrapping around" the address space.
-+            //      We do not rely on that.
-+
-+            // Firstly, create uninitialized $base.
-+            let base: MaybeUninit<$base> = MaybeUninit::uninit();
-+            let base: *const $base = base.as_ptr();
-+
-+            // Then get pointers to a field.
-+            // This is an UB, since we are creating reference to an uninitialized memory.
-+            let field = core::ptr::addr_of!((&*base)$(.$field)*);
-+
-+            // Cast everything into u8 pointers, so all units are bytes.
-+            let base = base as *const u8;
-+            let field = field as *const u8;
-+
-+            // Finally, compute the offset
-+            field.offset_from(base)
-+        }
-+    }
-+}
-+
-+pub use crate::bindings::{
-+    TIMER_DEFERRABLE as DEFERRABLE,
-+    TIMER_IRQSAFE as IRQSAFE,
-+    TIMER_PINNED as PINNED,
-+};
-+
-+pub struct Timer<'a, F=fn()> {
-+    // Timer is Unpin, since list have a pointer to callback function. which is stored in the same
-+    // struct. Probably in future we can implement Unpin for Timer when F is zero-sized-type.
-+    _pinned: PhantomPinned,
-+    // FIXME: We should wrap list into Rc, since it can be used while callback is running
-+    // In such scenario we will create and use two mutable references to same timer_list.
-+    list: MaybeUninit<timer_list>,
-+    callback: F,
-+    name: CStr<'a>,
-+    key: MaybeUninit<lock_class_key>,
-+}
-+
-+// FIXME: It is not safe.
-+unsafe impl<'a, F> Send for Timer<'a, F> {}
-+unsafe impl<'a, F> Sync for Timer<'a, F> {}
-+
-+pub struct TimerArgs<'a, F> {
-+    pub name: CStr<'a>,
-+    pub callback: F,
-+    pub flags: u32
-+}
-+
-+// TODO: Builder pattern
-+
-+impl<'a, F> Timer<'a, F> where F: Fn() {
-+    const LIST_OFFSET: isize = memoffset!(Self => list);
-+    unsafe extern "C" fn wrapper(list: *mut timer_list) {
-+        let base = (list as *const u8).offset(-Self::LIST_OFFSET);
-+        // FIXME: Is it safe?
-+        let this = &*(base as *const Self);
-+        (this.callback)();
-+    }
-+
-+    /// # Safety
-+    /// Caller must ensure that place contains correct struct, with timer and key uninitialized.
-+    unsafe fn initialize(self: Pin<&mut Self>, flags: u32) -> Pin<&mut Self> {
-+        // FIXME: It's better to avoid using as_ptr() and then casting to *mut T
-+        //        But Pin protects us from accessing &mut Self directly.
-+        init_timer_key(
-+            /* timer */ self.list.as_ptr() as *mut _,
-+            /* func  */ Some(Self::wrapper),
-+            /* flags */ flags,
-+            /* name  */ self.name.as_ptr() as *const i8,
-+            /* key   */ self.key.as_ptr() as *mut _,
-+        );
-+        self
-+    }
-+
-+    /// # Safety
-+    /// This function returns Timer without initializing it's fields.
-+    /// Caller MUST call .initialize() before using timer.
-+    unsafe fn new_uninitialized(args: TimerArgs<'a, F>) -> (Self, u32) {
-+        let res = Self {
-+            _pinned: PhantomPinned::default(),
-+            list: MaybeUninit::uninit(),
-+            name: args.name,
-+            key: MaybeUninit::uninit(),
-+            callback: args.callback
-+        };
-+        (res, args.flags)
-+    }
-+
-+    /// Creates timer inside of pinned MaybeUninit.
+ use core::ops::DerefMut;
++use core::pin::Pin;
+ 
+ pub struct TimerBuilder<'a, C> {
+     pub name: CStr<'a>,
+     pub callback: C,
+-    pub flags: u32
++    pub flags: u32,
+ }
+ 
+ #[macro_export]
+@@ -23,33 +20,34 @@ macro_rules! timer {
+         $crate::timer::TimerBuilder::new(
+             // C-macro uses variable name as timer name.
+             // In Rust we will be using filename and line instead
+-            /* name */ $crate::cstr!(concat!(
+-                core::file!(),
+-                "_",
+-                core::line!()
+-            )),
+-            $callback
++            $crate::cstr!(concat!(core::file!(), "_", core::line!())),
++            $callback,
+         )
+-    }
++    };
+ }
+ 
++/// TimerBuilder allows
++/// # Example
+ /// ```rust
+-/// let mut timer: Pin<Box<Timer<_>> =
+-///     TimerBuilder::new(
+-///         cstr!("HelloTimer"),
+-///         || println!("Hello from timer!")
+-///     )
++/// fn handler() {
++///     println!("Hello from timer!");
++/// }
++/// let mut timer: Pin<Box<Timer<'static, fn()>> =
++///     TimerBuilder::new(cstr!("HelloTimer"), handler)
+ ///     .irqsafe()
+ ///     .boxed();
+ /// timer.modify(jiffies() + 5*HZ)
+ /// ```
+-impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
++impl<'a, C> TimerBuilder<'a, C>
++where
++    C: TimerCallback,
++{
+     /// Creates new builder with provided name and callback.
+     pub fn new(name: CStr<'a>, callback: C) -> Self {
+         Self {
+             name,
+             callback,
+-            flags: 0
++            flags: 0,
+         }
+     }
+ 
+@@ -64,8 +62,8 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+ 
+     /// An irqsafe timer is executed with IRQ disabled and it's safe to wait for
+     /// the completion of the running instance from IRQ handlers, for example,
+-    /// by calling del_timer_sync(). FIXME!
+-    /// 
++    /// by calling del_timer_sync(). FIXME: we have no del_timer_sync
 +    ///
-+    /// # Safety
-+    /// Caller must drop previous timer if there is any.
-+    pub unsafe fn initialize_in<P>(mut place: Pin<P>, args: TimerArgs<'a, F>)
-+        where P: DerefMut<Target = MaybeUninit<Self>>
-+    {
-+        // SAFETY: We MUST call .initialize() after pinning:
-+        let (uninit, flags) = Self::new_uninitialized(args);
-+
-+        place.set(MaybeUninit::new(uninit));
-+        let result: Pin<&mut MaybeUninit<Self>> = place.as_mut();
-+
-+        // SAFETY:
-+        // 1. We just initialized MaybeUninit, so we can dereference pointer.
-+        // 2. Map function is good in terms of "map_unchecked_mut".
-+        let result: Pin<&mut Self> = result.map_unchecked_mut(|x| &mut *x.as_mut_ptr());
-+
-+        result.initialize(flags);
-+    }
-+
-+    /// Creates timer inside of pinned option, dropping and overwriting previous timer if any.
-+    pub fn in_option<'b, P>(place: &'b mut Pin<P>, args: TimerArgs<'a, F>) -> Pin<&'b mut Self>
-+        where P: DerefMut<Target = Option<Self>>
-+    {
-+        unsafe {
-+            // SAFETY: We MUST call .initialize() after pinning:
-+            let (uninit, flags) = Self::new_uninitialized(args);
-+
-+            place.set(Some(uninit));
-+            let result: Pin<&mut Option<Self>> = place.as_mut();
-+
-+            // SAFETY:
-+            // 1. We just initialized Option, so we can unsafely unwrap it.
-+            //    FIXME: Waiting fot [option_result_unwrap_unchecked] stabilized
-+            //    [option_result_unwrap_unchecked]: https://github.com/rust-lang/rust/issues/63291
-+            // 2. Map function is good in terms of "map_unchecked_mut".
-+            let result: Pin<&mut Self> = result
-+                .map_unchecked_mut(|x| x.as_mut().unwrap());
-+
-+            result.initialize(flags)
-+        }
-+    }
-+
-+    /// Creates timer on heap and returns it.
-+    ///
-+    /// Eaisest and safest way to create a timer.
-+    pub fn boxed(args: TimerArgs<'a, F>) -> Pin<Box<Self>> {
-+        unsafe {
-+            let (uninit, flags) = Self::new_uninitialized(args);
-+
-+            let mut result: Pin<Box<Self>> = Box::pin(uninit);
-+            result.as_mut().initialize(flags);
-+
-+            result
-+        }
-+    }
-+
-+    /// Returns was the timer active.
-+    /// ie. modifying inactive timer will return false.
-+    pub fn modify(self: Pin<&mut Self>, expires: u64) -> bool {
-+        let res = unsafe {
-+            // SAFETY: We won't move any data
-+            let this = self.get_unchecked_mut();
-+            // SAFETY: self.list is initialized
-+            mod_timer(this.list.as_mut_ptr(), expires)
-+        };
-+        res != 0
-+    }
-+}
-+
-+impl<F> Drop for Timer<'_, F> {
-+    fn drop(&mut self) {
-+        unsafe {
-+            let timer_list = self.list.as_mut_ptr();
-+            del_timer(timer_list);
-+            core::ptr::drop_in_place(timer_list);
-+
-+            core::ptr::drop_in_place(self.key.as_mut_ptr());
-+        }
-+    }
-+}
+     /// Note: The irq disabled callback execution is a special case for
+     /// workqueue locking issues. It's not meant for executing random crap
+     /// with interrupts disabled. Abuse is monitored!
+@@ -79,8 +77,8 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+     /// # Safety
+     /// Caller must drop previous timer if there is any.
+     pub unsafe fn in_uninit<'b, P>(self, place: &'b mut Pin<P>) -> Pin<&'b mut Timer<'a, C>>
+-        where
+-            P: DerefMut<Target = MaybeUninit<Timer<'a, C>>>,
++    where
++        P: DerefMut<Target = MaybeUninit<Timer<'a, C>>>,
+     {
+         // SAFETY: We MUST call .initialize() after pinning:
+         let (uninit, flags) = Timer::new_uninitialized(self);
+@@ -91,8 +89,7 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+         // SAFETY:
+         // 1. We just initialized MaybeUninit, so we can dereference pointer.
+         // 2. Map function is good in terms of "map_unchecked_mut".
+-        let result: Pin<&mut _> = result
+-            .map_unchecked_mut(|x| &mut *x.as_mut_ptr());
++        let result: Pin<&mut _> = result.map_unchecked_mut(|x| &mut *x.as_mut_ptr());
+ 
+         result.initialize(flags)
+     }
+@@ -118,7 +115,8 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+     /// }
+     /// ```
+     pub fn in_option<'b, P>(self, place: &'b mut Pin<P>) -> Pin<&'b mut Timer<'a, C>>
+-        where P: DerefMut<Target = Option<Timer<'a, C>>>
++    where
++        P: DerefMut<Target = Option<Timer<'a, C>>>,
+     {
+         unsafe {
+             // SAFETY: We MUST call .initialize() after pinning:
+@@ -132,8 +130,7 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+             //    FIXME: Waiting for [option_result_unwrap_unchecked] stabilized
+             //    [option_result_unwrap_unchecked]: https://github.com/rust-lang/rust/issues/63291
+             // 2. Map function is good in terms of "map_unchecked_mut".
+-            let result: Pin<&mut _> = result
+-                .map_unchecked_mut(|x| x.as_mut().unwrap());
++            let result: Pin<&mut _> = result.map_unchecked_mut(|x| x.as_mut().unwrap());
+ 
+             result.initialize(flags)
+         }
+@@ -156,15 +153,15 @@ impl<'a, C> TimerBuilder<'a, C> where C: TimerCallback {
+     }
+ }
+ 
+-/// This trait may be extended in future to give more features.
+-/// So it's not recommended to implement it directly.
+-/// Better to use closures or any other types that implement FnMut().
+ pub trait TimerCallback: Send + Sync + Sized {
+-    fn invoke(&mut self);
++    fn invoke(&mut self, timer: Pin<&mut Timer<'_, Self>>);
+ }
+ 
+-impl<F> TimerCallback for F where F: Send + Sync + Sized + FnMut() {
+-    fn invoke(&mut self) {
++impl<F> TimerCallback for F
++where
++    F: Send + Sync + Sized + FnMut(),
++{
++    fn invoke(&mut self, _timer: Pin<&mut Timer<'_, Self>>) {
+         (self)()
+     }
+ }
+@@ -175,8 +172,8 @@ pub struct Timer<'a, C> {
+     // which is stored in the same struct.
+     _pinned: PhantomPinned,
+     list: MaybeUninit<timer_list>,
+-    // SAFETY: Do not use this field while there is possibility for callback to be run.
+-    callback: C,
++    // UnsafeCell since C callbacks does not fit well with Rust borrowing rules
++    callback: UnsafeCell<C>,
+     name: CStr<'a>,
+     key: MaybeUninit<lock_class_key>,
+ }
+@@ -185,23 +182,21 @@ pub struct Timer<'a, C> {
+ unsafe impl<'a, C> Send for Timer<'a, C> where C: Send {}
+ unsafe impl<'a, C> Sync for Timer<'a, C> where C: Sync {}
+ 
+-impl<'a, C> Timer<'a, C> where C: TimerCallback {
++impl<'a, C> Timer<'a, C>
++where
++    C: TimerCallback,
++{
+     unsafe extern "C" fn wrapper(list: *mut timer_list) {
+         let container: *const Self = crate::container_of!(list, Self, list);
+-        let offset_in_bytes = crate::offset_of!(Self, callback);
+-        let callback: *const C = (container as *const u8).offset(offset_in_bytes) as *const _;
+ 
+-        // SAFETY:
+-        // Timer is owned somewhere else and thus be modified unexpectedly.
+-        // Here we are creating reference to the field bypassing Rust's borrowing rules,
+-        // so theoretically callback can be dropped right after dereferencing pointer.
+-        // But is safe for a reasons:
+-        // 1. We do not allow changing callback while callback can be called by kernel.
+-        // 2. Timer won't finish dropping until callback can be called.
+-        // 3. callback field is not accessed anywhere else at this moment, so it's safe to create
+-        //    an mutable reference mut.
+-        let callback = &mut *(callback as *mut C);
+-        callback.invoke();
++        // SAFETY: This is unsafe and unsound and UB and very-very bad.
++        // We are creating a _mutable_ reference for timer, that is owned somewhere else.
++        // So it's violating Grand Rust Rules of ownership.
++        // But it does work and deadline is near and also I don't see an easy way to fix it.
++        
++        let this: &mut Self = &mut *(container as *mut _);
++        let this = Pin::new_unchecked(this);
++        (*this.callback.get()).invoke(this);
+     }
+ 
+     /// Calls init_timer_key and initializes all required fields.
+@@ -214,10 +209,10 @@ impl<'a, C> Timer<'a, C> where C: TimerCallback {
+         //        But Pin protects us from accessing &mut Self directly.
+         init_timer_key(
+             /* timer */ self.list.as_ptr() as *mut _,
+-            /* func  */ Some(Self::wrapper),
++            /* func */ Some(Self::wrapper),
+             /* flags */ flags,
+-            /* name  */ self.name.as_ptr() as *const i8,
+-            /* key   */ self.key.as_ptr() as *mut _,
++            /* name */ self.name.as_ptr() as *const i8,
++            /* key */ self.key.as_ptr() as *mut _,
+         );
+         self
+     }
+@@ -231,7 +226,7 @@ impl<'a, C> Timer<'a, C> where C: TimerCallback {
+             list: MaybeUninit::uninit(),
+             name: args.name,
+             key: MaybeUninit::uninit(),
+-            callback: args.callback
++            callback: UnsafeCell::new(args.callback),
+         };
+         (res, args.flags)
+     }

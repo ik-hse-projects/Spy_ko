@@ -1,35 +1,13 @@
 diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
-index 504bb0a21..529db02bf 100644
+index 87ef968f46ce..7727408d5e91 100644
 --- a/rust/kernel/lib.rs
 +++ b/rust/kernel/lib.rs
-@@ -17,7 +17,11 @@
+@@ -17,7 +17,7 @@
      alloc_error_handler,
      const_fn,
      const_mut_refs,
--    try_reserve
-+    const_ptr_offset_from,
-+    const_raw_ptr_deref,
-+    const_maybe_uninit_as_ptr,
-+    const_refs_to_cell,
-+    try_reserve,
+-    try_reserve,
++    try_reserve
  )]
  #![deny(clippy::complexity)]
  #![deny(clippy::correctness)]
-@@ -33,7 +37,8 @@ use core::panic::PanicInfo;
- 
- mod allocator;
- 
--#[doc(hidden)]
-+//#[doc(hidden)]
-+#[allow(warnings, unused, missing_docs)]
- pub mod bindings;
- 
- pub mod buffer;
-@@ -51,6 +56,7 @@ pub mod printk;
- pub mod random;
- mod static_assert;
- pub mod sync;
-+pub mod timer;
- 
- #[cfg(CONFIG_SYSCTL)]
- pub mod sysctl;

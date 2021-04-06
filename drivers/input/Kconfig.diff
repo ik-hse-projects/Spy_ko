@@ -1,0 +1,20 @@
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index ec0e861f185f..e1a0f2496996 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -26,6 +26,15 @@ config INPUT
+ 
+ if INPUT
+ 
++config INPUT_PS2COUNTER
++	tristate "Module that counts number of keypresses per minute"
++	default INPUT
++	help
++	  If unsure, say N.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called ps2_counter.
++
+ config INPUT_LEDS
+ 	tristate "Export input device LEDs in sysfs"
+ 	depends on LEDS_CLASS
