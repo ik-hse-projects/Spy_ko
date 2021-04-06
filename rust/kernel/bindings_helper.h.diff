@@ -1,11 +1,12 @@
 diff --git a/rust/kernel/bindings_helper.h b/rust/kernel/bindings_helper.h
-index 16d69147766a..d041676bf7e0 100644
+index 39b0cea37d61..d041676bf7e0 100644
 --- a/rust/kernel/bindings_helper.h
 +++ b/rust/kernel/bindings_helper.h
-@@ -11,6 +11,7 @@
+@@ -10,6 +10,8 @@
+ #include <linux/version.h>
  #include <linux/miscdevice.h>
  #include <linux/poll.h>
- #include <linux/timer.h>
++#include <linux/timer.h>
 +#include <linux/interrupt.h>
  
  // `bindgen` gets confused at certain things

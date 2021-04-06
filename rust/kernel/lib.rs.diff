@@ -1,13 +1,12 @@
 diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
-index 87ef968f46ce..7727408d5e91 100644
+index b49789c227aa..7727408d5e91 100644
 --- a/rust/kernel/lib.rs
 +++ b/rust/kernel/lib.rs
-@@ -17,7 +17,7 @@
-     alloc_error_handler,
-     const_fn,
-     const_mut_refs,
--    try_reserve,
-+    try_reserve
- )]
- #![deny(clippy::complexity)]
- #![deny(clippy::correctness)]
+@@ -51,6 +52,8 @@ pub mod printk;
+ pub mod random;
+ mod static_assert;
+ pub mod sync;
++pub mod timer;
+ 
+ #[cfg(CONFIG_SYSCTL)]
+ pub mod sysctl;
